@@ -38,6 +38,7 @@ var (
 	ErrCannotVerifyMergeableForTagRef                    = errors.New("cannot verify mergeable into tag reference")
 	ErrNetworkRepositoryDoesNotDeclareRequiredController = errors.New("network repository does not declare required controller repository")
 	ErrNetworkRepositoryHasStaleControllerMetadata       = errors.New("network repository has not fetched latest controller metadata")
+	ErrFirstRSLEntryInvalidUnrecoverable                 = errors.New("first RSL entry for reference is invalid and unrecoverable")
 )
 
 // PolicyVerifier implements various gittuf verification workflows.
@@ -375,7 +376,7 @@ func (v *PolicyVerifier) VerifyNetwork(ctx context.Context) error {
 		// Identify the most recent entry in the network repo's RSL that is for
 		// the policy ref
 		slog.Debug(fmt.Sprintf("Identifying latest policy entry in network repository '%s'...", entry.GetName()))
-		latestNetworkPolicyEntry, _, err := rsl.GetLatestReferenceUpdaterEntry(networkRepo, rsl.ForReference(PolicyRef))
+		latestNetworkPolicyEntry, _, err := rsl.GetLatestReferenceUpdaterEntry(networkRepo, rsl.ForReference(PolicyRef), rsl.IsUnskipped())
 		if err != nil {
 			return err
 		}
@@ -623,27 +624,37 @@ func (v *PolicyVerifier) VerifyRelativeForRef(ctx context.Context, firstEntry, l
 		// takes the place of the original queue. This ensures that all entries
 		// are processed even when an invalid state is reached.
 
-		// 1. What's the last good state?
-		slog.Debug("Identifying last valid state...")
+		var (
+			lastGoodTreeID gitinterface.Hash
+			firstEntry     bool
+		)
 		lastGoodEntry, lastGoodEntryAnnotations, err := rsl.GetLatestReferenceUpdaterEntry(v.repo, rsl.ForReference(invalidEntry.GetRefName()), rsl.BeforeEntryID(invalidEntry.GetID()), rsl.IsUnskipped(), rsl.IsReferenceEntry())
 		if err != nil {
-			return err
-		}
-		slog.Debug("Verifying identified last valid entry has not been revoked...")
-		if lastGoodEntry.(*rsl.ReferenceEntry).SkippedBy(lastGoodEntryAnnotations) {
-			// this type assertion is fine because we use the rsl.IsReferenceEntry opt
-			return ErrLastGoodEntryIsSkipped
-		}
-		// require lastGoodEntry != nil
+			if !errors.Is(err, rsl.ErrRSLEntryNotFound) {
+				return err
+			}
 
-		// TODO: what if the very first entry for a ref is a violation?
+			slog.Debug("Invalid entry is the first entry for the ref, using empty tree as last good state...")
+			lastGoodTreeID, err = v.repo.EmptyTree()
+			if err != nil {
+				return err
+			}
+			firstEntry = true
+		} else {
+			slog.Debug("Verifying identified last valid entry has not been revoked...")
+			if lastGoodEntry.(*rsl.ReferenceEntry).SkippedBy(lastGoodEntryAnnotations) {
+				// this type assertion is fine because we use the rsl.IsReferenceEntry opt
+				return ErrLastGoodEntryIsSkipped
+			}
 
-		// gittuf requires the fix to point to a commit that is tree-same as the
-		// last good state
-		lastGoodTreeID, err := v.repo.GetCommitTreeID(lastGoodEntry.GetTargetID())
-		if err != nil {
-			return err
+			// gittuf requires the fix to point to a commit that is tree-same as the
+			// last good state
+			lastGoodTreeID, err = v.repo.GetCommitTreeID(lastGoodEntry.GetTargetID())
+			if err != nil {
+				return err
+			}
 		}
+		// require lastGoodEntry != nil || firstEntry == true
 
 		// 2. What entries do we have in the current verification set for the
 		// ref? The first one that is tree-same as lastGoodEntry's commit is the
@@ -710,6 +721,9 @@ func (v *PolicyVerifier) VerifyRelativeForRef(ctx context.Context, firstEntry, l
 
 		if !fixed {
 			// If we haven't found a fix, return the original error
+			if firstEntry {
+				return fmt.Errorf("%w: %w", ErrFirstRSLEntryInvalidUnrecoverable, verificationErr)
+			}
 			return verificationErr
 		}
 
@@ -846,7 +860,7 @@ func getApproverAttestationAndKeyIDs(ctx context.Context, repo *gitinterface.Rep
 
 	firstEntry := false
 	slog.Debug(fmt.Sprintf("Searching for RSL entry for '%s' before entry '%s'...", entry.RefName, entry.ID.String()))
-	priorRefEntry, _, err := rsl.GetLatestReferenceUpdaterEntry(repo, rsl.ForReference(entry.RefName), rsl.BeforeEntryID(entry.ID))
+	priorRefEntry, _, err := rsl.GetLatestReferenceUpdaterEntry(repo, rsl.ForReference(entry.RefName), rsl.BeforeEntryID(entry.ID), rsl.IsUnskipped())
 	if err != nil {
 		if !errors.Is(err, rsl.ErrRSLEntryNotFound) {
 			return nil, nil, err
@@ -969,7 +983,7 @@ func getApproverAttestationAndKeyIDsForIndex(ctx context.Context, repo *gitinter
 func getCommits(repo *gitinterface.Repository, entry *rsl.ReferenceEntry) ([]gitinterface.Hash, error) {
 	firstEntry := false
 
-	priorRefEntry, _, err := rsl.GetLatestReferenceUpdaterEntry(repo, rsl.ForReference(entry.RefName), rsl.BeforeEntryID(entry.ID))
+	priorRefEntry, _, err := rsl.GetLatestReferenceUpdaterEntry(repo, rsl.ForReference(entry.RefName), rsl.BeforeEntryID(entry.ID), rsl.IsUnskipped())
 	if err != nil {
 		if !errors.Is(err, rsl.ErrRSLEntryNotFound) {
 			return nil, err
